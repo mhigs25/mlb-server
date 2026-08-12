@@ -376,3 +376,7 @@ async def team_info(team_id: int) -> DisplayData:
     if "next" in game:
         data.next = NextGame(**game["next"])
     return data
+
+@app.get("/health")
+def health_check():
+    return "healthy!"

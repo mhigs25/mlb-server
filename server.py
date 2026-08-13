@@ -133,6 +133,7 @@ class NextGame(BaseModel):
     home: TeamInfo = TeamInfo()
     away: TeamInfo = TeamInfo()
     startTime: str = ""
+    startDate: str = ""  # "MM/DD", font-safe for the ESP32
 
 
 class DisplayData(BaseModel):
@@ -163,7 +164,7 @@ SCHEDULE_FIELDS = "dates,games,gamePk,status,abstractGameState,detailedState"
 GAME_FIELDS = (
     "gameData,status,abstractGameState,detailedState,"
     "teams,home,away,name,abbreviation,"
-    "datetime,time,ampm,"
+    "datetime,time,ampm,officialDate,"
     "liveData,linescore,currentInning,isTopInning,outs,balls,strikes,"
     "runs,offense,defense,batter,pitcher,fullName,id,first,second,third,"
     "boxscore,players,person,stats,batting,hits,atBats,pitching,numberOfPitches"
@@ -333,9 +334,25 @@ async def fetch_game_data(team_id: int) -> dict:
     time_str = dt.get("time", "")
     ampm = dt.get("ampm", "")
     start_time = f"{time_str} {ampm}" if ampm else time_str
+
+    # officialDate is "YYYY-MM-DD"; reformat to font-safe "MM/DD".
+    start_date = ""
+    official = dt.get("officialDate", "")
+    if official:
+        try:
+            d = datetime.strptime(official, "%Y-%m-%d")
+            start_date = d.strftime("%m/%d")
+        except ValueError:
+            start_date = ""
+
     return {
         "hasCurrentGame": False,
-        "next": {"home": home, "away": away, "startTime": start_time},
+        "next": {
+            "home": home,
+            "away": away,
+            "startTime": start_time,
+            "startDate": start_date,
+        },
     }
 
 

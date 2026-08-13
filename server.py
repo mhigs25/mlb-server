@@ -136,6 +136,11 @@ class NextGame(BaseModel):
     startDate: str = ""  # "MM/DD", font-safe for the ESP32
 
 
+class PrevGame(BaseModel):
+    home: TeamInfo = TeamInfo()  # score = final runs
+    away: TeamInfo = TeamInfo()
+
+
 class DisplayData(BaseModel):
     teamId: int
     leagueId: int = 0
@@ -150,6 +155,9 @@ class DisplayData(BaseModel):
     # conditional structure; hasCurrentGame selects which to read.
     current: CurrentGame = CurrentGame()
     next: NextGame = NextGame()
+    # The last completed game, independent of hasCurrentGame. Default-filled when
+    # there's no recent Final game in the schedule window.
+    prev: PrevGame = PrevGame()
 
 
 # --- The four fetches, ported from net.cpp ----------------------------------
@@ -169,11 +177,16 @@ GAME_FIELDS = (
     "runs,offense,defense,batter,pitcher,fullName,id,first,second,third,"
     "boxscore,players,person,stats,batting,hits,atBats,pitching,numberOfPitches"
 )
+# A completed game needs only team identities + final runs. Much smaller than
+# GAME_FIELDS (no boxscore/players/offense) and a different URL, so it caches
+# separately from the live feed.
+PREV_FIELDS = "gameData,teams,home,away,name,abbreviation,liveData,linescore,runs"
 
 TTL_TEAM = 24 * 60 * 60
 TTL_STANDINGS = 10 * 60
 TTL_SCHEDULE = 60
 TTL_GAME = 5
+TTL_PREV = 10 * 60  # a Final game's data is immutable
 
 # States that linger in the schedule but won't be played as scheduled.
 SKIP_STATES = {"Postponed", "Cancelled", "Canceled", "Suspended"}
@@ -263,22 +276,72 @@ def _player_stats(box_teams: dict, person_id: int, group: str) -> dict:
     return {}
 
 
-async def fetch_game_data(team_id: int) -> dict:
-    """-> {hasCurrentGame, current?, next?}. Empty dict when there's no game.
+async def fetch_prev_game(game_pk: int) -> dict:
+    """-> {'prev': {...}} for the last completed game, or {} if game_pk is 0.
 
-    Live-feed failures propagate as HTTPException(502); the caller decides
-    whether to degrade to standings-only.
+    A prev-feed failure is swallowed (logged) so it can never take down the
+    live/next game or the standings panel; a completed box score is the least
+    important thing on the display.
+    """
+    if game_pk == 0:
+        return {}  # no recent Final game in the window (season opener, off-season gap)
+
+    url = f"{BASE}/api/v1.1/game/{game_pk}/feed/live?fields={PREV_FIELDS}"
+    try:
+        doc = await fetch_json(url, TTL_PREV)
+    except HTTPException as exc:
+        log.warning("prev game %s unavailable: %s", game_pk, exc.detail)
+        return {}
+
+    gd = doc.get("gameData", {})
+    ls = doc.get("liveData", {}).get("linescore", {})
+    teams = gd.get("teams", {})
+    ls_teams = ls.get("teams", {})
+
+    def team_final(side: str) -> dict:
+        t = teams.get(side, {})
+        return {
+            "name": t.get("name", ""),
+            "abbrev": t.get("abbreviation", ""),
+            "score": ls_teams.get(side, {}).get("runs", 0),
+        }
+
+    return {"prev": {"home": team_final("home"), "away": team_final("away")}}
+
+
+async def fetch_game_data(team_id: int) -> dict:
+    """-> {hasCurrentGame, current?, next?, prev?}.
+
+    Current/next-feed failures propagate as HTTPException(502); the caller
+    decides whether to degrade to standings-only. The prev game is fetched
+    independently and never fails the request (see fetch_prev_game).
     """
     ids = await fetch_game_ids(team_id)
     has_current = ids["current"] != 0
     game_id = ids["current"] if has_current else ids["next"]
+
+    # The previous game is independent of current/next, so fetch it concurrently.
+    # It's also present in the off-season, when current/next are both 0.
+    prev_task = asyncio.create_task(fetch_prev_game(ids["prev"]))
+
     if game_id == 0:
         # No live or upcoming game (off-season, or a gap wider than the window).
-        # Skip the live feed entirely; the device still renders the standings panel.
-        return {"hasCurrentGame": False}
+        # Skip the live feed; the device still renders standings + prev game.
+        result = {"hasCurrentGame": False}
+        result.update(await prev_task)
+        return result
 
     url = f"{BASE}/api/v1.1/game/{game_id}/feed/live?fields={GAME_FIELDS}"
-    doc = await fetch_json(url, TTL_GAME)
+    try:
+        doc = await fetch_json(url, TTL_GAME)
+    except HTTPException as exc:
+        # Live/next-feed failure degrades to standings + prev, rather than
+        # blanking everything; net.cpp ignores fetch failures and leaves the
+        # panel stale. The prev game (fetched independently) is still returned.
+        log.warning("current/next game unavailable for teamId %s: %s", team_id, exc.detail)
+        result = {"hasCurrentGame": False}
+        result.update(await prev_task)
+        return result
 
     gd = doc.get("gameData", {})
     ld = doc.get("liveData", {})
@@ -328,7 +391,9 @@ async def fetch_game_data(team_id: int) -> dict:
                 "third": "third" in off,
             },
         }
-        return {"hasCurrentGame": True, "current": current}
+        result = {"hasCurrentGame": True, "current": current}
+        result.update(await prev_task)
+        return result
 
     dt = gd.get("datetime", {})
     time_str = dt.get("time", "")
@@ -345,7 +410,7 @@ async def fetch_game_data(team_id: int) -> dict:
         except ValueError:
             start_date = ""
 
-    return {
+    result = {
         "hasCurrentGame": False,
         "next": {
             "home": home,
@@ -354,6 +419,8 @@ async def fetch_game_data(team_id: int) -> dict:
             "startDate": start_date,
         },
     }
+    result.update(await prev_task)
+    return result
 
 
 # --- Endpoint ---------------------------------------------------------------
@@ -374,9 +441,10 @@ async def team_info(team_id: int) -> DisplayData:
     try:
         game = await game_task
     except HTTPException as exc:
-        # Live-feed failure degrades to standings-only (200) rather than failing
-        # the whole request; net.cpp ignores fetch return values and leaves the
-        # panel stale rather than blank.
+        # Schedule fetch failed (no gamePks at all) -> degrade to standings-only
+        # (200) rather than failing the whole request; net.cpp ignores fetch
+        # return values and leaves the panel stale rather than blank. Live/next
+        # and prev feed failures are already handled inside fetch_game_data.
         log.warning("game data unavailable for teamId %s: %s", team_id, exc.detail)
         game = {"hasCurrentGame": False}
 
@@ -392,6 +460,8 @@ async def team_info(team_id: int) -> DisplayData:
         data.current = CurrentGame(**game["current"])
     if "next" in game:
         data.next = NextGame(**game["next"])
+    if "prev" in game:
+        data.prev = PrevGame(**game["prev"])
     return data
 
 @app.get("/health")

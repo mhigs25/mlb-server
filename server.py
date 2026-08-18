@@ -184,6 +184,15 @@ def _index_logo_paths() -> dict[str, Path]:
     return {p.stem: p for p in LOGOS_DIR.glob("*/*/*.png")}
 
 
+def _normalize_logo(pixels: list[list[list[int]]]) -> list[list[list[int]]]:
+    """Scale every channel so the largest value across the grid becomes 255."""
+    max_val = max(v for row in pixels for px in row for v in px)
+    if max_val == 0:
+        return pixels
+    scale = 255 / max_val
+    return [[[round(v * scale) for v in px] for px in row] for row in pixels]
+
+
 def get_team_logo(abbreviation: str) -> list[list[list[int]]]:
     """-> 16x16 [r,g,b] grid for `abbreviation`, or solid black if no logo file."""
     global _logo_paths
@@ -200,6 +209,7 @@ def get_team_logo(abbreviation: str) -> list[list[list[int]]]:
     else:
         img = Image.open(path).convert("RGB")
         pixels = [[list(img.getpixel((x, y))) for x in range(16)] for y in range(16)]
+        pixels = _normalize_logo(pixels)
 
     _logo_cache[abbreviation] = pixels
     return pixels

@@ -13,6 +13,6 @@ fi
 source "$VENV/bin/activate"
 
 pip install --quiet --upgrade pip
-pip install --quiet 'fastapi==0.115.*' 'uvicorn==0.34.*' 'httpx==0.28.*'
+pip install --quiet 'fastapi==0.115.*' 'uvicorn==0.34.*' 'httpx==0.28.*' 'Pillow==12.*'
 
 exec uvicorn server:app --host 0.0.0.0 --port "${PORT:-8000}"

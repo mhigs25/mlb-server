@@ -10,10 +10,12 @@ import asyncio
 import logging
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from PIL import Image
+from pydantic import BaseModel, Field
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("mlb-server")
@@ -141,6 +143,10 @@ class PrevGame(BaseModel):
     away: TeamInfo = TeamInfo()
 
 
+def _black_logo() -> list[list[list[int]]]:
+    return [[[0, 0, 0] for _ in range(16)] for _ in range(16)]
+
+
 class DisplayData(BaseModel):
     teamId: int
     leagueId: int = 0
@@ -158,6 +164,45 @@ class DisplayData(BaseModel):
     # The last completed game, independent of hasCurrentGame. Default-filled when
     # there's no recent Final game in the schedule window.
     prev: PrevGame = PrevGame()
+    # 16x16 array of [r,g,b], row-major top-to-bottom/left-to-right, sourced from
+    # logos/<LEAGUE>/<DIVISION>/<ABBREV>.png. Black when the team has no logo file.
+    logo: list[list[list[int]]] = Field(default_factory=_black_logo)
+
+
+# --- Team logo lookup --------------------------------------------------------
+
+LOGOS_DIR = Path(__file__).parent / "logos"
+
+# abbreviation -> pixel grid, built lazily and kept for the life of the process
+# (30 teams, static PNGs — no TTL needed).
+_logo_cache: dict[str, list[list[list[int]]]] = {}
+# abbreviation -> file path, indexed once from logos/<LEAGUE>/<DIVISION>/<ABBR>.png
+_logo_paths: dict[str, Path] | None = None
+
+
+def _index_logo_paths() -> dict[str, Path]:
+    return {p.stem: p for p in LOGOS_DIR.glob("*/*/*.png")}
+
+
+def get_team_logo(abbreviation: str) -> list[list[list[int]]]:
+    """-> 16x16 [r,g,b] grid for `abbreviation`, or solid black if no logo file."""
+    global _logo_paths
+    if abbreviation in _logo_cache:
+        return _logo_cache[abbreviation]
+
+    if _logo_paths is None:
+        _logo_paths = _index_logo_paths()
+
+    path = _logo_paths.get(abbreviation)
+    if path is None:
+        log.warning("no logo file for abbreviation %s", abbreviation)
+        pixels = _black_logo()
+    else:
+        img = Image.open(path).convert("RGB")
+        pixels = [[list(img.getpixel((x, y))) for x in range(16)] for y in range(16)]
+
+    _logo_cache[abbreviation] = pixels
+    return pixels
 
 
 # --- The four fetches, ported from net.cpp ----------------------------------
@@ -453,6 +498,7 @@ async def team_info(team_id: int) -> DisplayData:
         leagueId=team["leagueId"],
         abbreviation=team["abbreviation"],
         trackedTeam=team["trackedTeam"],
+        logo=get_team_logo(team["abbreviation"]),
         **standings,
     )
     data.hasCurrentGame = game.get("hasCurrentGame", False)

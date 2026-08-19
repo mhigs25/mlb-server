@@ -117,6 +117,27 @@ class BaseRunners(BaseModel):
     third: bool = False
 
 
+class InningScore(BaseModel):
+    inning: int = 0
+    away: int = -1  # -1 = that half-inning hasn't been batted (MLB omits the key)
+    home: int = -1
+
+
+def _empty_scoreboard() -> list[InningScore]:
+    return [InningScore(inning=n) for n in range(1, 10)]
+
+
+class TeamTotals(BaseModel):
+    runs: int = 0
+    hits: int = 0
+    errors: int = 0
+
+
+class GameTotals(BaseModel):
+    away: TeamTotals = TeamTotals()
+    home: TeamTotals = TeamTotals()
+
+
 class CurrentGame(BaseModel):
     gameId: int = 0
     home: TeamInfo = TeamInfo()
@@ -129,6 +150,11 @@ class CurrentGame(BaseModel):
     strikes: int = 0
     balls: int = 0
     runners: BaseRunners = BaseRunners()
+    # Per-inning runs, always >= 9 entries (grows for extra innings). -1 means
+    # that half-inning hasn't been batted yet.
+    scoreboard: list[InningScore] = Field(default_factory=_empty_scoreboard)
+    # R/H/E; totals.{side}.runs restates home/away.score by design (see TeamInfo.score).
+    totals: GameTotals = GameTotals()
 
 
 class NextGame(BaseModel):
@@ -230,7 +256,10 @@ GAME_FIELDS = (
     "datetime,time,ampm,officialDate,"
     "liveData,linescore,currentInning,isTopInning,outs,balls,strikes,"
     "runs,offense,defense,batter,pitcher,fullName,id,first,second,third,"
-    "boxscore,players,person,stats,batting,hits,atBats,pitching,numberOfPitches"
+    "boxscore,players,person,stats,batting,hits,atBats,pitching,numberOfPitches,"
+    # innings,num -> per-inning linescore for the scoreboard array; errors ->
+    # completes R/H/E alongside the runs/hits already whitelisted above.
+    "innings,num,errors"
 )
 # A completed game needs only team identities + final runs. Much smaller than
 # GAME_FIELDS (no boxscore/players/offense) and a different URL, so it caches
@@ -329,6 +358,43 @@ def _player_stats(box_teams: dict, person_id: int, group: str) -> dict:
             if player.get("person", {}).get("id") == person_id:
                 return player.get("stats", {}).get(group, {}) or {}
     return {}
+
+
+MIN_INNINGS = 9
+
+
+def _scoreboard(ls: dict) -> list[dict]:
+    """Per-inning runs, padded to at least 9. -1 means that half-inning hasn't been
+    batted: MLB omits the runs key for the in-progress inning, and for a bottom of
+    the 9th the home team never needed. Keyed by MLB's 'num' rather than array
+    position, so padding can't silently shift a run into the wrong inning.
+    """
+    by_num = {i["num"]: i for i in ls.get("innings", []) if i.get("num")}
+    last = max([*by_num, MIN_INNINGS])  # grows past 9 for extra innings
+    return [
+        {
+            "inning": n,
+            "away": by_num.get(n, {}).get("away", {}).get("runs", -1),
+            "home": by_num.get(n, {}).get("home", {}).get("runs", -1),
+        }
+        for n in range(1, last + 1)
+    ]
+
+
+def _totals(ls_teams: dict) -> dict:
+    """R/H/E per side. Zeros are correct here: a game total is always meaningful,
+    unlike a single half-inning that hasn't been batted yet.
+    """
+
+    def side_totals(side: str) -> dict:
+        t = ls_teams.get(side, {})
+        return {
+            "runs": t.get("runs", 0),
+            "hits": t.get("hits", 0),
+            "errors": t.get("errors", 0),
+        }
+
+    return {"away": side_totals("away"), "home": side_totals("home")}
 
 
 async def fetch_prev_game(game_pk: int) -> dict:
@@ -445,6 +511,8 @@ async def fetch_game_data(team_id: int) -> dict:
                 "second": "second" in off,
                 "third": "third" in off,
             },
+            "scoreboard": _scoreboard(ls),
+            "totals": _totals(ls_teams),
         }
         result = {"hasCurrentGame": True, "current": current}
         result.update(await prev_task)
